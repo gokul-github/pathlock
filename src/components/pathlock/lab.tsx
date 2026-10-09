@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Pause, Play, RotateCcw, SkipForward } from "lucide-react";
+import { LinkTheater } from "@/components/pathlock/link-theater";
 import {
   BLOCKS,
   GROUPS,
@@ -47,7 +48,7 @@ export function Lab() {
     }
     const id = window.setTimeout(() => {
       setCursor((c) => Math.min(c + 1, session.stages.length - 1));
-    }, 1400);
+    }, 2400);
     return () => window.clearTimeout(id);
   }, [playing, cursor, session.stages.length]);
 
@@ -80,8 +81,8 @@ export function Lab() {
           <p className="font-mono text-xs tracking-widest text-secure">PATHLOCK</p>
           <h1 className="mt-1 text-2xl font-medium text-fg sm:text-3xl">HDCP on a cockpit stream</h1>
           <p className="mt-2 max-w-xl text-sm text-muted">
-            Where Netflix, Disney+, and Prime Video are decrypted, and where the serializer
-            encrypts the cable to the display.
+            Where the title is decrypted, where the serializer encrypts picture and audio
+            onto the cable, and where the amplifier plays.
           </p>
         </div>
         <p
@@ -96,6 +97,8 @@ export function Lab() {
           {status.label}
         </p>
       </header>
+
+      <LinkTheater stage={stage} />
 
       <div className="mt-6 grid gap-8 lg:grid-cols-2 lg:items-start">
         <div className="flex flex-col gap-8">
@@ -464,25 +467,27 @@ function PictureStrip({ stage }: { stage: Stage | null }) {
     ? [
         { label: "App", tile: stage.picture.app },
         { label: "TEE", tile: stage.picture.tee },
+        { label: "Amp", tile: ampTile(stage) },
         { label: "Cable", tile: stage.picture.cable },
         { label: "Panel", tile: stage.picture.panel },
       ]
     : [
         { label: "App", tile: "cenc" },
         { label: "TEE", tile: "idle" },
+        { label: "Amp", tile: "idle" },
         { label: "Cable", tile: "idle" },
         { label: "Panel", tile: "black" },
       ];
   return (
     <div className="rounded-md border border-line bg-bg p-3">
       <p className="font-mono text-xs text-muted">Where the frame is</p>
-      <div className="mt-2 grid grid-cols-4 gap-2">
+      <div className="mt-2 grid grid-cols-5 gap-2">
         {cells.map((cell) => (
           <div
             key={cell.label}
             className={cx("rounded-md border px-1 py-2 text-center", tileClass(cell.tile))}
           >
-            <span className="block font-mono text-xs">{tileWord(cell.tile)}</span>
+            <span className="block font-mono text-xs">{tileWord(cell.tile, cell.label)}</span>
             <span className="mt-1 block text-xs text-current opacity-80">{cell.label}</span>
           </div>
         ))}
@@ -496,7 +501,15 @@ function PictureStrip({ stage }: { stage: Stage | null }) {
   );
 }
 
-function tileWord(tile: Tile) {
+function ampTile(stage: Stage | null): Tile {
+  if (!stage) return "idle";
+  if (stage.block === "app" || stage.block === "license") return "idle";
+  if (stage.title.startsWith("OEMCrypto")) return "idle";
+  return "clear";
+}
+
+function tileWord(tile: Tile, label = "") {
+  if (label === "Amp" && tile === "clear") return "PCM";
   if (tile === "cenc") return "CENC";
   if (tile === "clear") return "clear";
   if (tile === "cipher") return "AES";

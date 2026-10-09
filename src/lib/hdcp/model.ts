@@ -10,7 +10,8 @@ export type BlockId =
   | "serializer"
   | "link"
   | "receiver"
-  | "panel";
+  | "panel"
+  | "amp";
 export type LockId = "cenc" | "cage" | "hdcp";
 export type Tile = "cenc" | "clear" | "cipher" | "black" | "idle";
 
@@ -42,6 +43,7 @@ export type Stage = {
     tee: Tile;
     cable: Tile;
     panel: Tile;
+    amp: Tile;
     caption: string;
   };
 };
@@ -99,13 +101,13 @@ export const LOCKS: { id: LockId; n: string; title: string; body: string }[] = [
     id: "cage",
     n: "02",
     title: "Plaintext exists only inside the housing",
-    body: "Decoded frames cross a few centimetres of on-board MIPI DSI to the serializer. Software cannot read them back.",
+    body: "Decoded frames and PCM cross a few centimetres of board to the serializer and the amplifier. Software cannot read them back.",
   },
   {
     id: "hdcp",
     n: "03",
     title: "HDCP encryption starts in the serializer",
-    body: "The serializer OTP holds the link secrets. It AES-encrypts the cable so the coax never carries pixels.",
+    body: "The serializer OTP holds the link secrets. It AES-encrypts video and the audio that shares that cable.",
   },
 ];
 
@@ -126,8 +128,8 @@ export const GROUPS: {
   {
     id: "hu",
     name: "Head unit · metal housing",
-    note: "REE, TEE, serializer",
-    blocks: ["app", "tee", "pipeline", "serializer"],
+    note: "REE, TEE, serializer, amp",
+    blocks: ["app", "tee", "pipeline", "serializer", "amp"],
     bridge: "Cable leaves the box here. HDCP ciphertext from this point.",
   },
   {
@@ -180,14 +182,14 @@ export const BLOCKS: Record<
   serializer: {
     title: "Serializer · HDCP transmitter",
     kicker: "Link chip",
-    summary: "Drives the long cable. Runs AKE, locality, and SKE in hardware, then AES-CTR.",
+    summary: "Drives the long cable. Runs AKE, locality, and SKE in hardware, then AES-CTR on picture and link audio.",
     holds: "lc128 in OTP. DCP public key to check certificates. HDCP 1.4 device keys if dual-mode.",
     never: "Head-unit software can start auth and read status. It cannot read the OTP back.",
   },
   link: {
     title: "Cable",
     kicker: "Off board",
-    summary: "Coax or shielded pair. A tap here sees the handshake and ciphertext, not the picture.",
+    summary: "Coax or shielded pair. A tap here sees the handshake and ciphertext, not the picture or the soundtrack.",
     holds: "Public messages: nonces, certificate, wrapped km, wrapped ks, riv.",
     never: "km in the clear, ks in the clear, lc128, kpriv, pixels.",
   },
@@ -204,6 +206,14 @@ export const BLOCKS: Record<
     summary: "Pixels exist again only after the receiver cipher. Chrome can stay up when video is withheld.",
     holds: "The picture, for the glass.",
     never: "A spliced capture device without keys gets noise, or a link that never authenticates.",
+  },
+  amp: {
+    title: "Amplifier",
+    kicker: "Secure audio",
+    summary:
+      "Plays PCM from the secure audio path inside the housing. It is not an HDCP transmitter or receiver.",
+    holds: "The soundtrack, as PCM on I2S, TDM, or a private amp bus.",
+    never: "No kpriv, no lc128, no ks. It does not answer AKE. HDCP audio is the copy that rides the display link.",
   },
 };
 
@@ -324,8 +334,17 @@ function pic(
   cable: Tile,
   panel: Tile,
   caption: string,
+  amp: Tile = "idle",
 ): Stage["picture"] {
-  return { app, tee, cable, panel, caption };
+  return { app, tee, cable, panel, amp, caption };
+}
+
+/** Cabin amp: PCM after the TEE decrypts. It never joins the HDCP state machine. */
+export function ampPlayback(stage: Stage | null): "idle" | "armed" | "play" {
+  if (!stage) return "idle";
+  if (stage.block === "app" || stage.block === "license") return "idle";
+  if (stage.title.startsWith("OEMCrypto")) return "armed";
+  return "play";
 }
 
 export function buildSession(input: Input): Session {
@@ -347,6 +366,72 @@ export function buildSession(input: Input): Session {
 
   const add = (s: Omit<Stage, "id">) => {
     stages.push({ ...s, id: `s${stages.length}` });
+  };
+
+  const addLinkAudio = (kind: "aes" | "hdcp14" | "off") => {
+    if (kind === "off") {
+      add({
+        title: "Display-link audio stays off",
+        block: "amp",
+        lock: "policy",
+        tone: "clear",
+        lead: "The cabin amplifier is not an HDCP receiver. The cable still has no soundtrack.",
+        body: "HDCP encrypts audio only when that audio rides the same link as the picture: same AKE, same locality check, same session key. This sink never finished that handshake, so the serializer does not put audio on the coax either. The amplifier already has PCM from the secure audio path, on I2S or a private amp bus inside the housing. It holds no certificate, no kpriv, and no lc128. You can hear the title in the cabin and still not lift it off the display harness.",
+        wire: {
+          from: "Secure audio path",
+          to: "Amplifier",
+          msg: "I2S / TDM PCM",
+          rows: [
+            { k: "amplifier", v: "PCM, inside the housing" },
+            { k: "display-link audio", v: "not enabled" },
+            { k: "HDCP on the amp", v: "none · no second handshake" },
+          ],
+        },
+        picture: pic(
+          "cenc",
+          "clear",
+          "idle",
+          "black",
+          "The amp has PCM. The display cable has neither the picture nor the soundtrack.",
+          "clear",
+        ),
+      });
+      return;
+    }
+    const aes = kind === "aes";
+    add({
+      title: "Amplifier plays the soundtrack",
+      block: "amp",
+      lock: "cage",
+      tone: "clear",
+      lead: aes
+        ? "Audio on the display link uses the same HDCP session. The amplifier does not."
+        : "The 1.4 keystream covers link audio too. The amplifier is still not an HDCP peer.",
+      body: aes
+        ? "Samples that share the serializer link are AES-128-CTR under ks ⊕ lc128, same session as the pixels. There is no audio-only AKE and no extra session key. The soundtrack the cabin hears is a different copy: the TEE decrypted it with the content key, and the secure audio path clocks it to the amplifier as PCM. The amp cannot see ks, km, or lc128. A tap on the display coax gets ciphertext for both picture and link-audio, never the PCM the speakers use."
+        : "HDCP 1.4 folds audio on that cable into the same stream cipher as the pixels. Still no separate audio handshake. The cockpit amplifier is fed PCM from inside the housing, not from the cluster receiver. The 1.4 device keys stay in the OTPs.",
+      wire: {
+        from: "Secure audio path",
+        to: "Amplifier",
+        msg: "I2S / TDM PCM",
+        rows: [
+          { k: "cabin speakers", v: "PCM, inside the housing" },
+          {
+            k: "display-link audio",
+            v: aes ? "AES-CTR · ks ⊕ lc128" : "inside the 1.4 keystream",
+          },
+          { k: "amp keys", v: "none" },
+        ],
+      },
+      picture: pic(
+        "cenc",
+        "clear",
+        "cipher",
+        "clear",
+        "The glass shows the picture. The amp plays PCM. Audio on the display link stays ciphertext.",
+        "clear",
+      ),
+    });
   };
 
   add({
@@ -419,7 +504,7 @@ export function buildSession(input: Input): Session {
     lock: "cage",
     tone: "clear",
     lead: "Inside the housing the hop to the serializer is plaintext.",
-    body: "The hardware composer can scan the protected layer onto the SoC’s display output. On this design that output is short-reach MIPI DSI (or OLDI) to the serializer, a few centimetres of PCB. There is no HDCP on that hop. What protects it is the metal housing and the fact that CPU software cannot read the buffers. HDCP starts in the next chip — the one that faces a cable someone can unplug.",
+    body: "The hardware composer can scan the protected layer onto the SoC’s display output. On this design that output is short-reach MIPI DSI (or OLDI) to the serializer, a few centimetres of PCB. There is no HDCP on that hop. What protects it is the metal housing and the fact that CPU software cannot read the buffers. The same secure path clocks decrypted PCM toward the amplifier on I2S. HDCP starts in the next chip — the one that faces a cable someone can unplug — and it covers both the pixels and any audio that shares that cable.",
     wire: null,
     picture: pic(
       "cenc",
@@ -508,6 +593,7 @@ export function buildSession(input: Input): Session {
       },
       picture: pic("cenc", "clear", "idle", "black", "Protected video is withheld. The cable never carries this title."),
     });
+    addLinkAudio("off");
     return abort(
       "Video withheld · no receiver",
       "Encryption never starts, because authentication never starts. The content key remains inside the TEE.",
@@ -555,6 +641,7 @@ export function buildSession(input: Input): Session {
       },
       picture: pic("cenc", "clear", "idle", "black", "The panel may show the shell UI. The movie plane is black."),
     });
+    addLinkAudio("off");
     return abort(
       "Video withheld · HDCP 1.4 is not enough",
       `${name} required ${floor}. The TEE decrypted the title and then refused to scan it out.`,
@@ -640,6 +727,7 @@ export function buildSession(input: Input): Session {
       },
       picture: pic("cenc", "clear", "idle", "black", "Authentication aborted. The glass does not get the title."),
     });
+    addLinkAudio("off");
     return abort(
       "Video withheld · receiver revoked",
       "The certificate chain was fine. The renewability list is what stops a leaked or compromised device.",
@@ -715,7 +803,7 @@ export function buildSession(input: Input): Session {
       lock: "hdcp",
       tone: "cipher",
       lead: "Not AES. A stream cipher seeded from the shared secret.",
-      body: "HDCP 1.4 generates a keystream from the shared secret and XOR-combines it with the pixels. There is no km, no ks, no locality check, and no lc128 in this version. It is weaker, which is why the strict studio rule refuses it. On this relaxed 720p title the serializer enables it and the cluster recovers the picture.",
+      body: "HDCP 1.4 generates a keystream from the shared secret and XOR-combines it with the pixels and with the audio that shares this cable. There is no km, no ks, no locality check, and no lc128 in this version. It is weaker, which is why the strict studio rule refuses it. On this relaxed 720p title the serializer enables it and the cluster recovers the picture. There is still no separate audio handshake.",
       wire: {
         from: "Serializer",
         to: "Cluster",
@@ -727,6 +815,7 @@ export function buildSession(input: Input): Session {
       },
       picture: pic("cenc", "clear", "cipher", "clear", "720p is on the glass. The coax carries 1.4 ciphertext, not AES-CTR."),
     });
+    addLinkAudio("hdcp14");
     return {
       protocol: "hdcp14",
       ok: true,
@@ -1033,6 +1122,7 @@ export function buildSession(input: Input): Session {
       },
       picture: pic("cenc", "clear", "idle", "black", "No ciphertext of the title is released onto the harness."),
     });
+    addLinkAudio("off");
     return {
       protocol: "aborted",
       ok: false,
@@ -1050,7 +1140,7 @@ export function buildSession(input: Input): Session {
     lock: "hdcp",
     tone: "cipher",
     lead: "This is the encryption step between head unit and display.",
-    body: "The serializer may enable HDCP only after AKE, locality, and SKE, and it waits a short guard time after SKE. The content cipher is AES-128 in counter mode. The AES key is ks ⊕ lc128 — the session key mixed with the global constant that never left either OTP. The counter is (riv ⊕ stream counter) concatenated with a per-block input counter, so the keystream moves on every 16 bytes and does not repeat next frame. Pixel blocks are XORed with that keystream. Audio on the same link is covered by the same session.",
+    body: "The serializer may enable HDCP only after AKE, locality, and SKE, and it waits a short guard time after SKE. The content cipher is AES-128 in counter mode. The AES key is ks ⊕ lc128 — the session key mixed with the global constant that never left either OTP. The counter is (riv ⊕ stream counter) concatenated with a per-block input counter, so the keystream moves on every 16 bytes and does not repeat next frame. Pixel blocks and the audio samples that share this link are XORed with that keystream. Same session. No audio-only key. The cabin amplifier is not this hop.",
     wire: {
       from: "Serializer",
       to: "Display",
@@ -1067,7 +1157,7 @@ export function buildSession(input: Input): Session {
       "clear",
       "cipher",
       "clear",
-      "Ciphertext on the coax. The panel has the picture again, after the receiver decrypts.",
+      "Ciphertext on the coax: picture and link audio. The receiver decrypts both. The cabin amp is a separate PCM path.",
     ),
   });
 
@@ -1077,16 +1167,19 @@ export function buildSession(input: Input): Session {
     lock: "hdcp",
     tone: "clear",
     lead: "Plaintext exists in two places, and neither of them is the cable.",
-    body: "The deserializer applies the same AES-CTR and drives the timing controller. Pixels are clear on the glass. They were also briefly clear on the internal DSI, inside the head unit. Everywhere a person can clip onto the harness, the title is AES ciphertext under ks ⊕ lc128. Drop the display, and the next connect repeats this exchange — faster if pairing is still stored.",
+    body: "The deserializer applies the same AES-CTR and drives the timing controller. Pixels are clear on the glass. Audio that came down this link is clear only after the same chip. Both were briefly clear inside the head unit, on DSI and on I2S. Everywhere a person can clip onto the display harness, the title is AES ciphertext under ks ⊕ lc128.",
     wire: null,
-    picture: pic("cenc", "clear", "cipher", "clear", `${name} is on the glass. The harness is still ciphertext.`),
+    picture: pic("cenc", "clear", "cipher", "clear", `${name} is on the glass. Link audio is ciphertext until the deserializer. The amp is not on this cable.`),
   });
+
+  addLinkAudio("aes");
 
   return {
     protocol: "hdcp22",
     ok: true,
     headline: "Link encrypted · HDCP 2.3",
-    detail: "DRM decryption happened in the TEE. Link encryption happened in the serializer. The app never held either key.",
+    detail:
+      "DRM decryption happened in the TEE. The serializer encrypts picture and link audio under one session. The amplifier plays a separate PCM copy and holds no HDCP keys.",
     floor,
     stages,
     keys: sessionKeys,
